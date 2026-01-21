@@ -1,0 +1,251 @@
+#include <Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+const int PIN_BTN   = 2;
+
+const int PIN_DS    = 3;
+const int PIN_LATCH = 4;
+const int PIN_CLK   = 5;
+
+const int PIN_DIG_ONES = 6;
+const int PIN_DIG_TENS = 7;
+const int PIN_DIG_HUND = 8;
+
+const int PIN_POT   = A0;
+const int PIN_SERVO = 10;
+
+const unsigned long REFRESH_US_PER_DIGIT = 400;
+const unsigned long SERVO_UPDATE_MS      = 20;
+const unsigned long LCD_UPDATE_MS        = 200;
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+byte BAR0[8] = {0,0,0,0,0,0,0,0};
+byte BAR1[8] = {0b10000,0b10000,0b10000,0b10000,0b10000,0b10000,0b10000,0b10000};
+byte BAR2[8] = {0b11000,0b11000,0b11000,0b11000,0b11000,0b11000,0b11000,0b11000};
+byte BAR3[8] = {0b11100,0b11100,0b11100,0b11100,0b11100,0b11100,0b11100,0b11100};
+byte BAR4[8] = {0b11110,0b11110,0b11110,0b11110,0b11110,0b11110,0b11110,0b11110};
+byte BAR5[8] = {0b11111,0b11111,0b11111,0b11111,0b11111,0b11111,0b11111,0b11111};
+
+Servo myServo;
+bool systemOn = false;
+
+int digitsToShow[3] = {0, 0, 0};
+int refreshIndex = 0;
+unsigned long lastRefreshUs = 0;
+
+unsigned long lastServoMs = 0;
+int lastAngle = -999;
+
+unsigned long lastLcdMs = 0;
+int lastPercent = -999;
+
+bool detectStartPress() {
+  static bool lastReading = HIGH;
+  static bool stableState = HIGH;
+  static unsigned long lastChangeMs = 0;
+
+  bool reading = digitalRead(PIN_BTN);
+
+  if (reading != lastReading) {
+    lastReading = reading;
+    lastChangeMs = millis();
+  }
+
+  if (millis() - lastChangeMs > 30) {
+    if (reading != stableState) {
+      stableState = reading;
+      if (stableState == LOW) return true;
+    }
+  }
+  return false;
+}
+
+const byte SEG_CC[10] = {
+  0b00111111,
+  0b00011000,
+  0b01110110,
+  0b01111100,
+  0b01011001,
+  0b01101101,
+  0b01101111,
+  0b00111000,
+  0b01111111,
+  0b01111101
+};
+const byte SEG_BLANK = 0b00000000;
+const byte SEG_DASH  = 0b01000000;
+
+void shift595(byte dataBits) {
+  digitalWrite(PIN_LATCH, LOW);
+  shiftOut(PIN_DS, PIN_CLK, LSBFIRST, (byte)(dataBits << 1));
+  digitalWrite(PIN_LATCH, HIGH);
+}
+
+inline void allDigitsOff() {
+  digitalWrite(PIN_DIG_ONES, LOW);
+  digitalWrite(PIN_DIG_TENS, LOW);
+  digitalWrite(PIN_DIG_HUND, LOW);
+}
+
+inline void digitOnIndex(int idx) {
+  if (idx == 0) digitalWrite(PIN_DIG_HUND, HIGH);
+  if (idx == 1) digitalWrite(PIN_DIG_TENS, HIGH);
+  if (idx == 2) digitalWrite(PIN_DIG_ONES, HIGH);
+}
+
+int readPotFiltered() {
+  long sum = 0;
+  for (int i = 0; i < 8; i++) {
+    sum += analogRead(PIN_POT);
+    delayMicroseconds(700);
+  }
+  return (int)(sum / 8);
+}
+
+void updateDigitsFromNumber(int number) {
+  number = constrain(number, 0, 999);
+  digitsToShow[0] = number / 100;
+  digitsToShow[1] = (number / 10) % 10;
+  digitsToShow[2] = number % 10;
+}
+
+void refreshDisplay() {
+  unsigned long now = micros();
+  if (now - lastRefreshUs < REFRESH_US_PER_DIGIT) return;
+  lastRefreshUs = now;
+
+  allDigitsOff();
+
+  byte seg = SEG_BLANK;
+  if (!systemOn) {
+    seg = SEG_DASH;
+  } else {
+    int hund = digitsToShow[0];
+    int tens = digitsToShow[1];
+    int ones = digitsToShow[2];
+
+    if (refreshIndex == 0) {
+      seg = (hund == 0) ? SEG_BLANK : SEG_CC[hund];
+    } else if (refreshIndex == 1) {
+      bool blankTens = (digitsToShow[0] == 0 && tens == 0);
+      seg = blankTens ? SEG_BLANK : SEG_CC[tens];
+    } else {
+      seg = SEG_CC[ones];
+    }
+  }
+
+  shift595(seg);
+  digitOnIndex(refreshIndex);
+
+  refreshIndex = (refreshIndex + 1) % 3;
+}
+
+int angleToPercent(int angle) {
+  angle = constrain(angle, 0, 180);
+  return (angle * 100 + 90) / 180;
+}
+
+void drawProgressBar(int percent) {
+  percent = constrain(percent, 0, 100);
+
+  int totalPixels = (percent * 80 + 50) / 100;
+  int fullCells = totalPixels / 5;
+  int rem = totalPixels % 5;
+
+  lcd.setCursor(0, 1);
+  for (int i = 0; i < 16; i++) {
+    if (i < fullCells) lcd.write((uint8_t)5);
+    else if (i == fullCells) lcd.write((uint8_t)rem);
+    else lcd.write((uint8_t)0);
+  }
+}
+
+void updateLcd(int angle, int percent) {
+  lcd.setCursor(0, 0);
+  lcd.print("Ang:");
+  if (angle < 100) lcd.print(' ');
+  if (angle < 10)  lcd.print(' ');
+  lcd.print(angle);
+  lcd.print((char)223);
+  lcd.print(" ");
+
+  if (percent < 100) lcd.print(' ');
+  if (percent < 10)  lcd.print(' ');
+  lcd.print(percent);
+  lcd.print("%   ");
+
+  drawProgressBar(percent);
+}
+
+void setup() {
+  pinMode(PIN_BTN, INPUT_PULLUP);
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+  pinMode(PIN_DS, OUTPUT);
+  pinMode(PIN_LATCH, OUTPUT);
+  pinMode(PIN_CLK, OUTPUT);
+
+  pinMode(PIN_DIG_ONES, OUTPUT);
+  pinMode(PIN_DIG_TENS, OUTPUT);
+  pinMode(PIN_DIG_HUND, OUTPUT);
+
+  allDigitsOff();
+  shift595(SEG_DASH);
+
+  myServo.attach(PIN_SERVO);
+  myServo.write(0);
+  updateDigitsFromNumber(0);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.createChar(0, BAR0);
+  lcd.createChar(1, BAR1);
+  lcd.createChar(2, BAR2);
+  lcd.createChar(3, BAR3);
+  lcd.createChar(4, BAR4);
+  lcd.createChar(5, BAR5);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Press button...");
+  lcd.setCursor(0, 1);
+  lcd.print("to start");
+}
+
+void loop() {
+  refreshDisplay();
+
+  if (!systemOn && detectStartPress()) {
+    systemOn = true;
+    lcd.clear();
+    lastLcdMs = 0;
+    lastPercent = -999;
+  }
+
+  if (!systemOn) return;
+
+  unsigned long nowMs = millis();
+  if (nowMs - lastServoMs >= SERVO_UPDATE_MS) {
+    lastServoMs = nowMs;
+
+    int potValue = readPotFiltered();
+    int angle = map(potValue, 0, 1023, 0, 180);
+
+    if (abs(angle - lastAngle) >= 2) {
+      lastAngle = angle;
+      myServo.write(angle);
+      updateDigitsFromNumber(angle);
+    }
+  }
+
+  int percent = angleToPercent(lastAngle < 0 ? 0 : lastAngle);
+  if (nowMs - lastLcdMs >= LCD_UPDATE_MS || percent != lastPercent) {
+    lastLcdMs = nowMs;
+    lastPercent = percent;
+    updateLcd(lastAngle < 0 ? 0 : lastAngle, percent);
+  }
+}
